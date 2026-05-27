@@ -1,21 +1,3 @@
-import json
-import atexit
-import random
-import argparse
-import threading
-from collections import deque
-from concurrent.futures import ThreadPoolExecutor, wait, FIRST_COMPLETED
-from enum import StrEnum
-from typing import Iterator, NamedTuple, Protocol, TypedDict
-from tqdm import tqdm
-from loguru import logger
-import os
-import time
-import requests
-from requests.adapters import HTTPAdapter
-
-from .config import SwarmConfig
-
 """Free-proxy-pool bulk fetcher with a pluggable use case.
 
 Architecture
@@ -83,6 +65,33 @@ Operational signals
   both clean exit and Ctrl-C, with per-invocation (not lifetime) counters.
 """
 
+import atexit
+import contextlib
+import ipaddress
+import json
+import math
+import os
+import random
+import threading
+import time
+from collections import deque
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
+from enum import StrEnum
+from pathlib import Path
+from typing import TYPE_CHECKING, ClassVar, NamedTuple, Protocol, TypedDict
+
+import requests
+from loguru import logger
+from requests.adapters import HTTPAdapter
+from tqdm import tqdm
+
+from .config import SwarmConfig
+
+if TYPE_CHECKING:
+    import argparse
+    from collections.abc import Iterator
+
+
 # ---------------------------------------------------------------------------
 
 
@@ -94,6 +103,8 @@ Operational signals
 # outcome-counter key — see `Stats._OUTCOME_KEYS`, which is derived from this
 # enum) and as direct equality targets in `if outcome == ...` checks.
 class FetchOutcome(StrEnum):
+    """Classification of a single HTTP attempt; see the comment above."""
+
     OK = "ok"  # body is the payload — call handle_success
     NOT_FOUND = "not_found"  # upstream doesn't have this item
     BAD_QUERY = "bad_query"  # malformed query; no point retrying
@@ -128,14 +139,18 @@ class Stats:
     # Every FetchOutcome value is a counter key, plus the transport keys above.
     # Deriving from the enum keeps the two in lockstep — add a FetchOutcome member
     # and its counter appears automatically, with no second list to update.
-    _OUTCOME_KEYS: tuple[str, ...] = tuple(o.value for o in FetchOutcome) + _TRANSPORT_KEYS
+    _OUTCOME_KEYS: tuple[str, ...] = (
+        tuple(o.value for o in FetchOutcome) + _TRANSPORT_KEYS
+    )
 
     def __init__(self) -> None:
+        """Initialize the lock and zeroed metric/outcome counters."""
         self._lock = threading.Lock()
         self.metrics: dict[str, int] = dict.fromkeys(self._METRIC_KEYS, 0)
         self.outcomes: dict[str, int] = dict.fromkeys(self._OUTCOME_KEYS, 0)
 
     def bump(self, key: str) -> None:
+        """Increment a per-sample metric counter; log-and-skip unknown keys."""
         with self._lock:
             if key not in self.metrics:
                 logger.error("Unknown metric key {!r} — not counted", key)
@@ -143,6 +158,7 @@ class Stats:
             self.metrics[key] += 1
 
     def bump_outcome(self, key: str) -> None:
+        """Increment a per-attempt outcome counter; log-and-skip unknown keys."""
         # Guard unknown keys instead of letting `dict[key] += 1` raise KeyError.
         # A plugin `UseCase.classify` can return a FetchOutcome the framework has
         # no counter for; without this guard the KeyError escapes `download` into
@@ -156,6 +172,7 @@ class Stats:
             self.outcomes[key] += 1
 
     def snapshot(self) -> tuple[dict[str, int], dict[str, int]]:
+        """Return a consistent copy of (metrics, outcomes) under the lock."""
         with self._lock:
             return dict(self.metrics), dict(self.outcomes)
 
@@ -187,7 +204,8 @@ class ProxyStateStore:
         state: dict[str, ProxyStats],
         pool_lock: threading.Lock,
         config: SwarmConfig,
-    ):
+    ) -> None:
+        """Bind the file path, shared state dict, pool lock, and config."""
         self.config = config
         self.state_file = state_file
         self.state = state
@@ -195,11 +213,12 @@ class ProxyStateStore:
         self._dirty = False
 
     @staticmethod
-    def load(state_file: str | None) -> dict:
-        if not state_file or not os.path.exists(state_file):
+    def load(state_file: str | None) -> dict[str, object]:
+        """Read and JSON-decode the state file, returning {} on any failure."""
+        if not state_file or not Path(state_file).exists():
             return {}
         try:
-            with open(state_file) as f:
+            with Path(state_file).open(encoding="utf-8") as f:
                 data = json.load(f)
         except (OSError, ValueError) as e:
             # OSError: unreadable/missing file. ValueError: malformed JSON
@@ -211,10 +230,12 @@ class ProxyStateStore:
         return data if isinstance(data, dict) else {}
 
     def mark_dirty(self) -> None:
+        """Flag that in-memory state has changed and needs a flush."""
         # Caller holds pool_lock.
         self._dirty = True
 
     def save(self) -> None:
+        """Atomically write state to disk via a temp file + rename, if dirty."""
         if not self.state_file:
             return
         with self._lock:
@@ -225,11 +246,12 @@ class ProxyStateStore:
         # Per-call tmp suffix so concurrent saves (background thread + atexit +
         # explicit save_state() on Ctrl-C) don't clobber each other's tmp file
         # before the atomic rename lands.
-        tmp = f"{self.state_file}.tmp.{os.getpid()}.{threading.get_ident()}"
+        dest = Path(self.state_file)
+        tmp = dest.with_name(f"{dest.name}.tmp.{os.getpid()}.{threading.get_ident()}")
         try:
-            with open(tmp, "w") as f:
+            with tmp.open("w", encoding="utf-8") as f:
                 f.write(payload)
-            os.replace(tmp, self.state_file)
+            tmp.replace(dest)
         except OSError as e:
             # Narrow to I/O failures (disk full, EROFS, bad path). A transient
             # write failure must not crash a long run — the state is warm-start
@@ -237,13 +259,10 @@ class ProxyStateStore:
             # under the lock above (outside this try), so a serialization bug
             # still propagates instead of being mislabeled "could not save".
             logger.warning("Could not save proxy state: {}", e)
-            if os.path.exists(tmp):
-                try:
-                    os.unlink(tmp)
-                except OSError:
-                    pass
+            tmp.unlink(missing_ok=True)
 
     def start_background_saver(self) -> None:
+        """Launch the periodic-flush daemon thread and register an atexit flush."""
         if not self.state_file:
             return
         threading.Thread(
@@ -258,13 +277,15 @@ class ProxyStateStore:
         # dies with the process; atexit handles the final flush.
         while True:
             time.sleep(self.config.save_interval_sec)
-            try:
+            # logger.catch swallows + logs any error so a transient fault
+            # (disk full, EROFS) doesn't kill the daemon loop.
+            with logger.catch(message="proxy-state-saver iteration failed; continuing"):
                 self.save()
-            except Exception:
-                logger.exception("proxy-state-saver iteration failed; continuing")
 
 
 class GateCounters(TypedDict):
+    """Cumulative opportunistic-insert gate tallies (see field comments)."""
+
     # Cumulative tally of which branch admitted/rejected each opportunistic
     # insert (see `ProxyPool._can_opportunistic_insert`). A fixed key set so the
     # reporter's bracket reads (`gate["drain"]` etc.) are type-checked.
@@ -275,6 +296,8 @@ class GateCounters(TypedDict):
 
 
 class MetricsSnapshot(NamedTuple):
+    """Periodic-reporter view of the pool (see field comments)."""
+
     # Periodic-reporter view of the pool. Named so the reporter doesn't have to
     # remember a 5-tuple's positional order — and so future fields can land
     # without breaking every caller.
@@ -287,6 +310,8 @@ class MetricsSnapshot(NamedTuple):
 
 
 class ProxyStats(TypedDict):
+    """Per-proxy persisted state; shape pinned for bracket-access reads."""
+
     # Per-proxy state, persisted to disk via ProxyStateStore. Every key is
     # initialized by `ProxyPool._empty_stats`, so consumers can use bracket
     # access (no `.get` fallback) — the type checker now verifies key names
@@ -354,7 +379,8 @@ class ProxyPool:
         proxies: list[str | None],
         config: SwarmConfig,
         state_file: str | None = None,
-    ):
+    ) -> None:
+        """Build the pool, load+prune persisted state, and seed the fast lane."""
         self.config = config
         # None represents "no proxy" (your real IP) — drop it if you don't want that.
         self.proxies = list(proxies) or [None]
@@ -364,7 +390,8 @@ class ProxyPool:
         # Fast lane: deque of the top-K known-good proxies by score (lower=faster &
         # more reliable). `good_candidates` is the full pool of ever-succeeded
         # proxies; `_refresh_good` rebuilds the deque from the top-K of that pool
-        # every self.config.refresh_interval successes. `good_set` is an O(1) membership guard.
+        # every self.config.refresh_interval successes. `good_set` is an O(1)
+        # membership guard.
         self.good: deque[str | None] = deque()
         self.good_set: set[str | None] = set()
         self.good_candidates: set[str | None] = set()
@@ -420,7 +447,8 @@ class ProxyPool:
                 1 for s in self.state.values() if s.get("cooldown_until", 0) > now
             )
             logger.info(
-                "Loaded persisted state for {} proxies ({} still on cooldown, {} seeded into fast-lane)",
+                "Loaded persisted state for {} proxies "
+                "({} still on cooldown, {} seeded into fast-lane)",
                 len(self.state),
                 cooled,
                 len(self.good),
@@ -428,6 +456,7 @@ class ProxyPool:
             self._store.start_background_saver()
 
     def save_state(self) -> None:
+        """Flush persisted proxy state to disk (public alias for the store)."""
         # Public alias preserved for callers (e.g. KeyboardInterrupt handler).
         self._store.save()
 
@@ -452,7 +481,8 @@ class ProxyPool:
         return ms / succ
 
     def _refresh_good(self) -> None:
-        # Caller holds the lock. Splits self.config.top_k_fast_lane between exploitation (top
+        # Caller holds the lock. Splits self.config.top_k_fast_lane between
+        # exploitation (top
         # by score from good_candidates) and exploration (under-sampled proxies
         # from the wider pool — see `_pick_explorers`). Any unused exploitation
         # budget (good_candidates smaller than the budget) rolls into exploration
@@ -504,7 +534,8 @@ class ProxyPool:
         return out
 
     def _lane_score_threshold(self) -> float | None:
-        # Caller holds the lock. Returns the score at self.config.lane_gate_percentile of the
+        # Caller holds the lock. Returns the score at
+        # self.config.lane_gate_percentile of the
         # current lane — the bar a candidate must beat to earn an opportunistic
         # spot. Returns None when the lane is empty (caller treats as "no bar").
         if not self.good:
@@ -556,7 +587,7 @@ class ProxyPool:
     # Numeric fields accept int|float because timestamps start as int 0 in
     # _empty_stats but become floats once written (time.time()); JSON round-trips
     # both. last_reason is str|None.
-    _STATS_FIELD_TYPES: dict[str, tuple[type, ...]] = {
+    _STATS_FIELD_TYPES: ClassVar[dict[str, tuple[type, ...]]] = {
         "attempts": (int,),
         "failures": (int,),
         "last_reason": (str,),
@@ -582,7 +613,10 @@ class ProxyPool:
             if value is None or isinstance(value, bool):
                 continue
             if isinstance(value, types):
-                base[field] = value  # type: ignore[literal-required]
+                # `field` is a dynamic str, but it's always a real ProxyStats key
+                # (it comes from _STATS_FIELD_TYPES, whose keys mirror the
+                # TypedDict). The checker can't prove that for a non-literal key.
+                base[field] = value  # ty: ignore[invalid-key]
         return base
 
     def _get(self, proxy: str | None) -> ProxyStats:
@@ -594,7 +628,7 @@ class ProxyPool:
         return s
 
     def _update_ewma(
-        self, stat: ProxyStats, sample_ms: float | None = None, success: bool = True
+        self, stat: ProxyStats, sample_ms: float | None = None, *, success: bool = True
     ) -> None:
         # Latency EWMA: seed directly on first observation; the 0.0 sentinel
         # would otherwise pull the EWMA toward zero.
@@ -629,7 +663,8 @@ class ProxyPool:
         if s["cooldown_until"] > now:
             return True
         # Long-term bad: high failure rate after enough attempts and the last failure
-        # was within the last day → keep cooling. Lets a flaky proxy recover after 24h idle.
+        # was within the last day → keep cooling. Lets a flaky proxy recover
+        # after 24h idle.
         if s["attempts"] >= self.config.min_attempts_for_rate:
             rate = s["failures"] / s["attempts"]
             if (
@@ -685,7 +720,8 @@ class ProxyPool:
         path in `Downloader.download` does this).
 
         Lock strategy: the fast lane runs under one acquire/release. The slow
-        lane releases and re-acquires between self.config.slow_lane_batch-sized chunks so
+        lane releases and re-acquires between self.config.slow_lane_batch-sized
+        chunks so
         50 workers don't serialize on a 100-iter discovery walk — a worker
         holding the lock for the full scan blocks 49 other workers' fast-lane
         rotations entirely. Three lock acquires on a full miss; one or two on
@@ -740,8 +776,11 @@ class ProxyPool:
         return None
 
     def mark_success(self, proxy: str | None, elapsed_ms: float | None = None) -> None:
-        """Credit a clean exchange. Clears cooldown, updates EWMAs, possibly
-        promotes the proxy into the fast lane (subject to the gate)."""
+        """Credit a clean exchange.
+
+        Clears cooldown, updates EWMAs, and possibly promotes the proxy into
+        the fast lane (subject to the gate).
+        """
         with self.lock:
             s = self._get(proxy)
             s["consecutive_failures"] = 0
@@ -767,9 +806,12 @@ class ProxyPool:
             self._store.mark_dirty()
 
     def mark_exhausted(self, proxy: str | None) -> None:
-        """Permanently retire a proxy for the rest of the run (hit the
-        upstream's per-IP / per-key daily cap). Cools until UTC midnight in
-        the persisted state so it rejoins automatically tomorrow."""
+        """Permanently retire a proxy for the rest of the run.
+
+        Triggered by hitting the upstream's per-IP / per-key daily cap. Cools
+        until UTC midnight in the persisted state so it rejoins automatically
+        tomorrow.
+        """
         with self.lock:
             if proxy not in self.exhausted:
                 self.exhausted.add(proxy)
@@ -811,6 +853,7 @@ class ProxyPool:
             )
 
     def alive_count(self) -> int:
+        """Return the number of proxies not permanently retired."""
         with self.lock:
             return len(self.proxies) - len(self.exhausted)
 
@@ -859,25 +902,33 @@ def _classify_proxy_scheme(port: str) -> str:
     return "socks5h" if port == "1080" else "http"
 
 
+def _is_bogus_proxy_host(host: str) -> bool:
+    # A public proxy must live at a globally-routable IP. `not is_global`
+    # rejects unspecified (0.0.0.0/::), loopback, link-local, multicast,
+    # reserved, and private (RFC1918) ranges in one IPv4/IPv6-aware check.
+    # Hostnames aren't IP literals — let them through for DNS to resolve later.
+    try:
+        ip = ipaddress.ip_address(host)
+    except ValueError:
+        return False
+    return not ip.is_global
+
+
 def _load_proxies(path: str) -> list[str | None]:
-    if not os.path.exists(path):
+    if not Path(path).exists():
         logger.warning("No proxies file at {}, running without proxies", path)
         return [None]
-    out = []
-    with open(path) as f:
+    out: list[str] = []
+    with Path(path).open(encoding="utf-8") as f:
         for raw in f:
             line = raw.strip()
             if not line or line.startswith("#"):
                 continue
             if "://" not in line:
                 host, _, port = line.partition(":")
-                # Filter obviously bogus entries.
-                if (
-                    not host
-                    or not port
-                    or host in ("0.0.0.0",)
-                    or host.startswith("127.")
-                ):
+                # Drop empty host/port and non-routable IP literals (loopback,
+                # private, unspecified, ...) — see `_is_bogus_proxy_host`.
+                if not host or not port or _is_bogus_proxy_host(host):
                     continue
                 line = f"{_classify_proxy_scheme(port)}://{host}:{port}"
             out.append(line)
@@ -901,7 +952,8 @@ class RequestSpec(NamedTuple):
     """How to call the upstream for one work item. Returned by `UseCase.build_request`.
 
     The framework wraps this with the chosen proxy, the shared session
-    headers, `stream=True`, `allow_redirects=True`, and `self.config.request_timeout_sec`
+    headers, `stream=True`, `allow_redirects=True`, and
+    `self.config.request_timeout_sec`
     before issuing — so the plugin doesn't need to think about transport.
     `json_` is named with a trailing underscore to avoid shadowing the
     `json` stdlib module imported at the top of this file.
@@ -943,26 +995,44 @@ class UseCase(Protocol):
     name: str
 
     @classmethod
-    def add_arguments(cls, p: argparse.ArgumentParser) -> None: ...
+    def add_arguments(cls, p: argparse.ArgumentParser) -> None:
+        """Register the use case's CLI flags onto the framework parser."""
+        ...
 
     @classmethod
-    def from_args(cls, args: argparse.Namespace) -> "UseCase": ...
+    def from_args(cls, args: argparse.Namespace) -> UseCase:
+        """Construct the use case from parsed CLI arguments."""
+        ...
 
-    def prepare(self) -> None: ...
+    def prepare(self) -> None:
+        """Run any one-time setup before the worker pool starts."""
+        ...
 
-    def session_headers(self) -> dict[str, str]: ...
+    def session_headers(self) -> dict[str, str]:
+        """Return headers to mount on the shared requests session."""
+        ...
 
-    def iter_items(self) -> Iterator[str]: ...
+    def iter_items(self) -> Iterator[str]:
+        """Yield the work-item ids to fetch."""
+        ...
 
-    def existing_ids(self) -> set[str]: ...
+    def existing_ids(self) -> set[str]:
+        """Return ids already complete, so resumed runs can skip them."""
+        ...
 
-    def build_request(self, item_id: str) -> RequestSpec: ...
+    def build_request(self, item_id: str) -> RequestSpec:
+        """Turn a work-item id into a `RequestSpec`."""
+        ...
 
     def classify(
         self, response: requests.Response
-    ) -> tuple[FetchOutcome, str | None, bytes]: ...
+    ) -> tuple[FetchOutcome, str | None, bytes]:
+        """Decode a response into (outcome, detail, body)."""
+        ...
 
-    def handle_success(self, item_id: str, body: bytes) -> bool: ...
+    def handle_success(self, item_id: str, body: bytes) -> bool:
+        """Persist a successful body; return False if it was corrupt."""
+        ...
 
 
 class APIThrottleDetector:
@@ -985,13 +1055,15 @@ class APIThrottleDetector:
     either the streak clears or it flips (e.g. rate_limited → auth_error).
     """
 
-    def __init__(self, threshold: int):
+    def __init__(self, threshold: int) -> None:
+        """Initialize with the consecutive-hit threshold that triggers a warning."""
         self.threshold = threshold
         self.streak = 0
         self.warned_label: str | None = None
         self.lock = threading.Lock()
 
     def observe(self, outcome: FetchOutcome) -> None:
+        """Update the key-throttle streak from one outcome; warn on threshold."""
         if outcome == FetchOutcome.RATE_LIMITED:
             label = "rate_limited"
         elif outcome == FetchOutcome.AUTH_ERROR:
@@ -1010,7 +1082,8 @@ class APIThrottleDetector:
                 self.warned_label = None
             if prior_label is not None:
                 logger.success(
-                    'API throttling cleared (was "{}" after {} consecutive hits) — resuming normal operation',
+                    'API throttling cleared (was "{}" after {} consecutive hits)'
+                    " — resuming normal operation",
                     prior_label,
                     prior_streak,
                 )
@@ -1022,7 +1095,8 @@ class APIThrottleDetector:
             if self.streak >= self.threshold and self.warned_label != label:
                 logger.warning(
                     '{} consecutive "{}" responses across different proxies — '
-                    "likely API-key throttling, not per-IP. Proxy rotation will not fix this.",
+                    "likely API-key throttling, not per-IP. "
+                    "Proxy rotation will not fix this.",
                     self.streak,
                     label,
                 )
@@ -1048,7 +1122,8 @@ class Downloader:
     --------
     `request_shutdown` flips `_shutdown_event` so in-flight workers bail at
     their next attempt boundary instead of grinding through their full retry
-    budget (up to `self.config.max_retry_attempts × self.config.request_timeout_sec` per worker). The Ctrl-C path in
+    budget (up to `self.config.max_retry_attempts ×
+    self.config.request_timeout_sec` per worker). The Ctrl-C path in
     `analyze_data` calls this before `pool.shutdown(wait=True)`.
     """
 
@@ -1060,7 +1135,8 @@ class Downloader:
         existing_ids: set[str],
         stats: Stats,
         config: SwarmConfig,
-    ):
+    ) -> None:
+        """Wire the shared session, pool, use case, dedup set, stats, and config."""
         self.config = config
         self.session = session
         self.proxy_pool = proxy_pool
@@ -1076,15 +1152,18 @@ class Downloader:
         )
         # Set on Ctrl-C so in-flight `download` calls bail at the next attempt
         # boundary instead of grinding through their full retry loop
-        # (up to self.config.max_retry_attempts × self.config.request_timeout_sec per worker). Without this, `pool.shutdown(wait=True)`
+        # (up to self.config.max_retry_attempts × self.config.request_timeout_sec
+        # per worker). Without this, `pool.shutdown(wait=True)`
         # blocks on workers that have no idea the user wants to quit.
         self._shutdown_event = threading.Event()
 
     def request_shutdown(self) -> None:
+        """Signal in-flight workers to bail at their next attempt boundary."""
         # Idempotent — but log once so the operator gets confirmation Ctrl-C registered.
         if not self._shutdown_event.is_set():
             logger.warning(
-                "Shutdown requested — workers will bail at next attempt boundary (~{}s max)",
+                "Shutdown requested — workers will bail at next attempt "
+                "boundary (~{}s max)",
                 self.config.request_timeout_sec,
             )
         self._shutdown_event.set()
@@ -1143,6 +1222,89 @@ class Downloader:
         elapsed_ms = (time.perf_counter() - t0) * 1000
         return response, elapsed_ms
 
+    def _acquire_with_backoff(self) -> str | None:
+        """Acquire a proxy, backing off while the pool is starved.
+
+        Returns the proxy, or None if shutdown was requested during a backoff
+        sleep (the caller should stop). Pool starvation waits here rather than
+        burning the per-item HTTP-attempt budget — otherwise a worker in a
+        trough eats all its attempts on backoff sleeps without ever sending a
+        request.
+        """
+        proxy = self.proxy_pool.acquire()
+        miss_count = 0
+        while proxy is None:
+            miss_count += 1
+            # 0.5, 1, 2, 4, 5, 5, ... seconds. `Event.wait` returns True if
+            # shutdown fires during the sleep — bail immediately in that case.
+            backoff = min(
+                self.config.acquire_retry_sleep_sec * (2 ** min(miss_count - 1, 4)),
+                self.config.acquire_backoff_cap_sec,
+            )
+            if self._shutdown_event.wait(backoff):
+                return None
+            proxy = self.proxy_pool.acquire()
+        return proxy
+
+    def _handle_classified(
+        self,
+        proxy: str | None,
+        item_id: str,
+        response: requests.Response,
+        elapsed_ms: float | None,
+        attempt: int,
+    ) -> bool:
+        """Classify one response and act on it.
+
+        Returns True if the item is finished (success, or an authoritative API
+        answer) and the retry loop should stop; False to try another proxy.
+        """
+        outcome, detail, body = self.use_case.classify(response)
+        self.stats.bump_outcome(outcome)
+        self._throttle_detector.observe(outcome)
+
+        if outcome == FetchOutcome.OK:
+            if self.use_case.handle_success(item_id, body):
+                self._record_have(item_id)
+                self.proxy_pool.mark_success(proxy, elapsed_ms)
+                logger.debug("Got {} via {} (attempt {})", item_id[:16], proxy, attempt)
+                self.stats.bump("success")
+                return True
+            # Use case rejected the body (e.g. corrupt zip) — proxy delivered
+            # partial / wrong data. Blame it and try another.
+            self.stats.bump_outcome("proxy_garbage")
+            self.proxy_pool.mark_bad(proxy, "corrupt body")
+            return False
+        if outcome == FetchOutcome.NOT_FOUND:
+            self.proxy_pool.mark_success(proxy, elapsed_ms)
+            logger.info("Item {} not found upstream", item_id[:16])
+            self.stats.bump("not_found")
+            return True
+        if outcome in (FetchOutcome.BAD_QUERY, FetchOutcome.AUTH_ERROR):
+            # Both are authoritative answers: credit the proxy (it answered;
+            # the query or API key is what's wrong, not the IP) and stop.
+            # Crediting keeps the acquire() contract — every reserved attempt
+            # pairs with exactly one mark_*.
+            self.proxy_pool.mark_success(proxy, elapsed_ms)
+            if outcome == FetchOutcome.BAD_QUERY:
+                logger.error("Malformed query for {}: {}", item_id[:16], detail)
+            else:
+                logger.error(
+                    "Auth problem ({}) — check credentials, aborting item {}",
+                    detail,
+                    item_id[:16],
+                )
+            self.stats.bump("failed")
+            return True
+        if outcome == FetchOutcome.RATE_LIMITED:
+            self.proxy_pool.mark_exhausted(proxy)
+            return False
+        # PROXY_BAD or PROXY_GARBAGE — try another proxy. `detail` is always a
+        # string on this branch (only OK leaves it None), but coalesce
+        # defensively so the type checker stays happy too.
+        self.proxy_pool.mark_bad(proxy, detail or "unknown")
+        return False
+
     @logger.catch(reraise=False, message="Unhandled exception in download worker")
     def download(self, item_id: str) -> None:
         """Fetch one item via the use case and persist it.
@@ -1164,85 +1326,23 @@ class Downloader:
         # interstitials, captive portals). Any non-OK response means "try the
         # next proxy" rather than dropping this item. We only give up when the
         # upstream answers definitively (NOT_FOUND / BAD_QUERY / AUTH_ERROR) or
-        # when the pool is fully drained.
+        # when the pool is fully drained. `max_attempts` budgets *real HTTP
+        # attempts* only — starvation backoff waits inside `_acquire_with_backoff`.
         max_attempts = min(
             self.config.max_retry_attempts,
             max(self.config.min_retry_attempts, self.proxy_pool.alive_count()),
         )
-        # `max_attempts` budgets *real HTTP attempts* only. Pool starvation (every
-        # proxy cooled / exhausted) waits in an inner loop instead of burning the
-        # budget — otherwise a worker in a trough eats all 40 attempts on backoff
-        # sleeps (~3 min) and fails the item without ever sending a request.
-        miss_count = 0
         for attempt in range(1, max_attempts + 1):
             if self._shutdown_event.is_set():
                 return
-            proxy = self.proxy_pool.acquire()
-            while proxy is None:
-                miss_count += 1
-                # 0.5, 1, 2, 4, 5, 5, ... seconds. `Event.wait` returns True if
-                # shutdown fires during the sleep — bail immediately in that case.
-                backoff = min(
-                    self.config.acquire_retry_sleep_sec * (2 ** min(miss_count - 1, 4)),
-                    self.config.acquire_backoff_cap_sec,
-                )
-                if self._shutdown_event.wait(backoff):
-                    return
-                proxy = self.proxy_pool.acquire()
-            miss_count = 0
-
+            proxy = self._acquire_with_backoff()
+            if proxy is None:
+                return  # shutdown requested during backoff
             response, elapsed_ms = self._post(proxy, item_id)
             if response is None:
                 continue
-
-            outcome, detail, body = self.use_case.classify(response)
-            self.stats.bump_outcome(outcome)
-            self._throttle_detector.observe(outcome)
-
-            if outcome == FetchOutcome.OK:
-                if self.use_case.handle_success(item_id, body):
-                    self._record_have(item_id)
-                    self.proxy_pool.mark_success(proxy, elapsed_ms)
-                    logger.debug(
-                        "Got {} via {} (attempt {})", item_id[:16], proxy, attempt
-                    )
-                    self.stats.bump("success")
-                    return
-                # Use case rejected the body (e.g. corrupt zip) — proxy delivered
-                # partial / wrong data. Blame it and try another.
-                self.stats.bump_outcome("proxy_garbage")
-                self.proxy_pool.mark_bad(proxy, "corrupt body")
-                continue
-            if outcome == FetchOutcome.NOT_FOUND:
-                self.proxy_pool.mark_success(proxy, elapsed_ms)
-                logger.info("Item {} not found upstream", item_id[:16])
-                self.stats.bump("not_found")
+            if self._handle_classified(proxy, item_id, response, elapsed_ms, attempt):
                 return
-            if outcome == FetchOutcome.BAD_QUERY:
-                self.proxy_pool.mark_success(proxy, elapsed_ms)
-                logger.error("Malformed query for {}: {}", item_id[:16], detail)
-                self.stats.bump("failed")
-                return
-            if outcome == FetchOutcome.AUTH_ERROR:
-                # Credit the proxy — it answered authoritatively, the API key
-                # is what's broken. Without this, `attempts` is incremented by
-                # `_reserve` but never paired with a mark_*, drifting the
-                # proxy's bookkeeping (see `acquire()` contract).
-                self.proxy_pool.mark_success(proxy, elapsed_ms)
-                logger.error(
-                    "Auth problem ({}) — check credentials, aborting item {}",
-                    detail,
-                    item_id[:16],
-                )
-                self.stats.bump("failed")
-                return
-            if outcome == FetchOutcome.RATE_LIMITED:
-                self.proxy_pool.mark_exhausted(proxy)
-                continue
-            # PROXY_BAD or PROXY_GARBAGE — try another proxy. `detail` is always
-            # a string on this branch (only the OK outcome leaves it None), but
-            # coalesce defensively so the type checker stays happy too.
-            self.proxy_pool.mark_bad(proxy, detail or "unknown")
 
         logger.error(
             "Exhausted {} attempts for {} ({} proxies alive)",
@@ -1253,16 +1353,88 @@ class Downloader:
         self.stats.bump("failed")
 
 
+_SECONDS_PER_MINUTE = 60
+_SECONDS_PER_HOUR = 3600
+
+
 def _fmt_eta(seconds: float) -> str:
-    if seconds <= 0 or seconds != seconds:  # 0 or NaN
+    if seconds <= 0 or math.isnan(seconds):  # 0 or NaN
         return "?"
-    if seconds < 60:
+    if seconds < _SECONDS_PER_MINUTE:
         return f"{int(seconds)}s"
-    if seconds < 3600:
+    if seconds < _SECONDS_PER_HOUR:
         return f"{int(seconds // 60)}m{int(seconds % 60):02d}s"
-    h = int(seconds // 3600)
-    m = int((seconds % 3600) // 60)
+    h = int(seconds // _SECONDS_PER_HOUR)
+    m = int((seconds % _SECONDS_PER_HOUR) // _SECONDS_PER_MINUTE)
     return f"{h}h{m:02d}m"
+
+
+def _emit_metrics_tick(
+    proxy_pool: ProxyPool,
+    stats: Stats,
+    threatcount: int,
+    start_ts: float,
+    last: float,
+    last_total: int,
+) -> tuple[float, int]:
+    """Emit one metrics + outcomes line; return the (time, total) next baseline."""
+    now = time.time()
+    m, o = stats.snapshot()
+    total = sum(m.values())
+    rate = (total - last_total) / max(now - last, 1e-6)
+    snap = proxy_pool.snapshot_metrics()
+    # ETA from cumulative average rate (more stable than the per-interval
+    # rate when the pool is bouncing around). `total` only counts samples
+    # this analyze_data invocation has processed since the reporter was
+    # given the post-baseline snapshot — but it includes baseline carry-
+    # over from prior invocations, which slightly under-estimates ETA.
+    # Acceptable: ETA is a hint, not a contract.
+    avg_rate = total / max(now - start_ts, 1e-6)
+    remaining = max(threatcount - total, 0)
+    eta_sec = remaining / avg_rate if avg_rate > 0 else 0.0
+    pct = (total / threatcount * 100) if threatcount > 0 else 0.0
+    logger.info(
+        "{:.0f}% ({}/{}) eta={} | rate={:.1f}/s | "
+        "ok={} skip={} 404={} fail={} | "
+        "fast_lane={} expl={} (med={:.0f}ms p90={:.0f}ms) cooled={} | "
+        "gate drain={} prob={} merit={} rej={}",
+        pct,
+        total,
+        threatcount,
+        _fmt_eta(eta_sec),
+        rate,
+        m["success"],
+        m["skipped"],
+        m["not_found"],
+        m["failed"],
+        snap.fast_lane,
+        snap.lane_explorers,
+        snap.lane_med_ms,
+        snap.lane_p90_ms,
+        snap.cooled,
+        snap.gate["drain"],
+        snap.gate["probation"],
+        snap.gate["merit"],
+        snap.gate["reject"],
+    )
+    # Per-attempt outcomes — surfaces *why* attempts fail. `rate_limited` here
+    # is the canary for API-key throttling (vs IP throttling); see
+    # APIThrottleDetector.
+    logger.info(
+        "outcomes | ok={} 404={} bad={} auth={} rate_lim={} "
+        "proxy_bad={} garbage={} timeout={} http={} conn={}",
+        o["ok"],
+        o["not_found"],
+        o["bad_query"],
+        o["auth_error"],
+        o["rate_limited"],
+        o["proxy_bad"],
+        o["proxy_garbage"],
+        o["timeout"],
+        o["http_error"],
+        o["conn_error"],
+    )
+    return now, total
 
 
 def _metrics_reporter(
@@ -1276,73 +1448,21 @@ def _metrics_reporter(
     last = time.time()
     last_total = 0
     while not stop_event.wait(config.metrics_interval_sec):
-        # Daemon thread — wrap each tick so a bad format-arg or pool mutation
-        # during snapshot doesn't kill the reporter silently for the rest of
-        # the run. Survives to the next interval and tries again.
-        try:
-            now = time.time()
-            m, o = stats.snapshot()
-            total = sum(m.values())
-            rate = (total - last_total) / max(now - last, 1e-6)
-            snap = proxy_pool.snapshot_metrics()
-            # ETA from cumulative average rate (more stable than the per-interval
-            # rate when the pool is bouncing around). `total` only counts samples
-            # this analyze_data invocation has processed since the reporter was
-            # given the post-baseline snapshot — but it includes baseline carry-
-            # over from prior invocations, which slightly under-estimates ETA.
-            # Acceptable: ETA is a hint, not a contract.
-            avg_rate = total / max(now - start_ts, 1e-6)
-            remaining = max(threatcount - total, 0)
-            eta_sec = remaining / avg_rate if avg_rate > 0 else 0.0
-            pct = (total / threatcount * 100) if threatcount > 0 else 0.0
-            logger.info(
-                "{:.0f}% ({}/{}) eta={} | rate={:.1f}/s | ok={} skip={} 404={} fail={} | "
-                "fast_lane={} expl={} (med={:.0f}ms p90={:.0f}ms) cooled={} | "
-                "gate drain={} prob={} merit={} rej={}",
-                pct,
-                total,
-                threatcount,
-                _fmt_eta(eta_sec),
-                rate,
-                m["success"],
-                m["skipped"],
-                m["not_found"],
-                m["failed"],
-                snap.fast_lane,
-                snap.lane_explorers,
-                snap.lane_med_ms,
-                snap.lane_p90_ms,
-                snap.cooled,
-                snap.gate["drain"],
-                snap.gate["probation"],
-                snap.gate["merit"],
-                snap.gate["reject"],
+        # Daemon thread — logger.catch swallows + logs any tick error (bad
+        # format-arg, pool mutation mid-snapshot) so it survives to the next
+        # interval instead of dying silently for the rest of the run. On error
+        # the (last, last_total) baseline is left unchanged.
+        with logger.catch(message="metrics-reporter iteration failed; continuing"):
+            last, last_total = _emit_metrics_tick(
+                proxy_pool, stats, threatcount, start_ts, last, last_total
             )
-            # Per-attempt outcomes — surfaces *why* attempts fail. `rate_limited` here
-            # is the canary for API-key throttling (vs IP throttling); see APIThrottleDetector.
-            logger.info(
-                "outcomes | ok={} 404={} bad={} auth={} rate_lim={} "
-                "proxy_bad={} garbage={} timeout={} http={} conn={}",
-                o["ok"],
-                o["not_found"],
-                o["bad_query"],
-                o["auth_error"],
-                o["rate_limited"],
-                o["proxy_bad"],
-                o["proxy_garbage"],
-                o["timeout"],
-                o["http_error"],
-                o["conn_error"],
-            )
-            last, last_total = now, total
-        except Exception:
-            logger.exception("metrics-reporter iteration failed; continuing")
 
 
 def analyze_data(
     downloader: Downloader,
     use_case: UseCase,
     config: SwarmConfig,
+    *,
     dry_run: bool = False,
 ) -> None:
     """Drive the worker pool through every item the use case yields.
@@ -1407,10 +1527,8 @@ def analyze_data(
                 done, in_flight = wait(in_flight, return_when=FIRST_COMPLETED)
                 for _ in done:
                     pbar.update(1)
-                    try:
+                    with contextlib.suppress(StopIteration):
                         in_flight.add(pool.submit(downloader.download, next(it)))
-                    except StopIteration:
-                        pass
     except KeyboardInterrupt:
         # Signal workers to bail at their next attempt boundary, then let
         # `finally` perform the bounded wait. The `raise` here re-raises *after*
@@ -1424,7 +1542,8 @@ def analyze_data(
     finally:
         stop_metrics.set()
         # With `_shutdown_event` set, in-flight workers exit within ~one HTTP
-        # timeout (config.request_timeout_sec) instead of grinding all config.max_retry_attempts. `cancel_futures` drops
+        # timeout (config.request_timeout_sec) instead of grinding all
+        # config.max_retry_attempts. `cancel_futures` drops
         # anything still queued. On the clean path (no interrupt) there's
         # nothing queued or running, so this is effectively a no-op.
         pool.shutdown(cancel_futures=True, wait=True)
@@ -1479,11 +1598,13 @@ def _log_startup_config(config: SwarmConfig) -> None:
 
 
 def _build_runtime(use_case: UseCase, config: SwarmConfig) -> Downloader:
-    """Wire up the runtime: load proxies, build the pool, run the use case's
-    `prepare` step, snapshot its `existing_ids`, mount a tuned HTTP session
-    with the use case's headers, return the `Downloader`. Logs the startup
-    config banner as a side effect so the first thing in the log file is
-    the tuning state."""
+    """Wire up and return the `Downloader` runtime.
+
+    Loads proxies, builds the pool, runs the use case's `prepare` step,
+    snapshots its `existing_ids`, and mounts a tuned HTTP session with the use
+    case's headers. Logs the startup config banner as a side effect so the
+    first thing in the log file is the tuning state.
+    """
     _log_startup_config(config)
     proxy_pool = ProxyPool(
         _load_proxies(config.proxies_file), config, state_file=config.proxy_state_file
@@ -1507,13 +1628,11 @@ def _build_runtime(use_case: UseCase, config: SwarmConfig) -> Downloader:
 
 
 def run(
-    use_case: UseCase, config: SwarmConfig | None = None, dry_run: bool = False
+    use_case: UseCase, config: SwarmConfig | None = None, *, dry_run: bool = False
 ) -> None:
     """Entry point for running a use case."""
     if config is None:
         config = SwarmConfig()
     downloader = _build_runtime(use_case, config)
-    try:
+    with contextlib.suppress(KeyboardInterrupt):
         analyze_data(downloader, use_case, config, dry_run=dry_run)
-    except KeyboardInterrupt:
-        pass

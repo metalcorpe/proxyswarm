@@ -2,8 +2,7 @@
 daily cap, EWMA updates, and disk-load coercion. All pure-unit; `time.time` is
 monkeypatched where the math depends on it."""
 
-import proxyswarm.core as core
-from proxyswarm import ProxyPool, SwarmConfig
+from proxyswarm import ProxyPool, SwarmConfig, core
 
 P1 = "http://1.1.1.1:8080"
 P2 = "http://2.2.2.2:8080"
@@ -30,6 +29,7 @@ def test_acquire_increments_attempts_and_usage() -> None:
 def test_mark_success_clears_cooldown_and_promotes() -> None:
     pool = make_pool()
     p = pool.acquire()
+    assert p is not None
     pool.mark_success(p, elapsed_ms=150.0)
     s = pool.state[p]
     assert s["consecutive_failures"] == 0
@@ -43,6 +43,7 @@ def test_mark_success_clears_cooldown_and_promotes() -> None:
 def test_mark_bad_records_failure_and_cooldown() -> None:
     pool = make_pool()
     p = pool.acquire()
+    assert p is not None
     pool.mark_bad(p, "timeout")
     s = pool.state[p]
     assert s["failures"] == 1
@@ -54,6 +55,7 @@ def test_mark_bad_records_failure_and_cooldown() -> None:
 def test_mark_exhausted_retires_until_midnight() -> None:
     pool = make_pool()
     p = pool.acquire()
+    assert p is not None
     pool.mark_exhausted(p)
     assert p in pool.exhausted
     assert pool.state[p]["cooldown_until"] > 0

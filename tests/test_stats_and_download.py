@@ -46,7 +46,7 @@ def test_bump_known_keys_count() -> None:
 class FakeUseCase:
     name = "fake"
 
-    def __init__(self, outcome: FetchOutcome, handle_ok: bool = True) -> None:
+    def __init__(self, outcome: FetchOutcome, *, handle_ok: bool = True) -> None:
         self._outcome = outcome
         self._handle_ok = handle_ok
 
@@ -63,9 +63,7 @@ class FakeUseCase:
 def make_downloader(use_case, monkeypatch, existing=None) -> Downloader:
     cfg = SwarmConfig()
     pool = ProxyPool([P1], cfg, state_file=None)
-    dl = Downloader(
-        requests.Session(), pool, use_case, existing or set(), Stats(), cfg
-    )
+    dl = Downloader(requests.Session(), pool, use_case, existing or set(), Stats(), cfg)
     # Replace the transport with a canned clean exchange so no socket is opened.
     monkeypatch.setattr(dl, "_post", lambda proxy, item_id: (object(), 100.0))
     return dl
@@ -92,9 +90,7 @@ def test_download_not_found_bumps_once(monkeypatch) -> None:
 
 
 def test_download_skips_already_have(monkeypatch) -> None:
-    dl = make_downloader(
-        FakeUseCase(FetchOutcome.OK), monkeypatch, existing={"item1"}
-    )
+    dl = make_downloader(FakeUseCase(FetchOutcome.OK), monkeypatch, existing={"item1"})
     dl.download("item1")
     metrics, _ = dl.stats.snapshot()
     assert metrics["skipped"] == 1

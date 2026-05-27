@@ -7,11 +7,15 @@ path-traversal guard and atomic, corrupt-safe writes are security-relevant.
 
 import io
 import json
+from typing import TYPE_CHECKING, cast
 
 import pyzipper
 
 import malware_bazaar as mb  # from examples/, via conftest sys.path insert
 from proxyswarm import FetchOutcome
+
+if TYPE_CHECKING:
+    import requests
 
 
 class FakeResponse:
@@ -32,14 +36,15 @@ class FakeResponse:
         self.closed = True
 
 
-def make_use_case(store: str) -> "mb.MalwareBazaarUseCase":
+def make_use_case(store: str) -> mb.MalwareBazaarUseCase:
     return mb.MalwareBazaarUseCase("exe", store, "index.csv", "test-key")
 
 
 def classify(*chunks: bytes):
     uc = make_use_case("unused")
     resp = FakeResponse(*chunks)
-    outcome, detail, body = uc.classify(resp)
+    # FakeResponse duck-types only what classify touches (iter_content/close).
+    outcome, detail, body = uc.classify(cast("requests.Response", resp))
     assert resp.closed, "classify must close the response in its finally"
     return outcome, detail, body
 
@@ -54,7 +59,9 @@ def test_zip_magic_is_ok() -> None:
 
 
 def test_json_file_not_found() -> None:
-    outcome, detail, _ = classify(json.dumps({"query_status": "file_not_found"}).encode())
+    outcome, detail, _ = classify(
+        json.dumps({"query_status": "file_not_found"}).encode()
+    )
     assert outcome == FetchOutcome.NOT_FOUND
     assert detail == "file_not_found"
 

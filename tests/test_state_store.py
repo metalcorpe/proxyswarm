@@ -62,7 +62,7 @@ def test_save_is_noop_when_not_dirty(tmp_path) -> None:
 
 def test_save_atomic_replace(tmp_path) -> None:
     f = tmp_path / "state.json"
-    state = {P1: dict(ProxyPool._empty_stats())}
+    state = {P1: ProxyPool._empty_stats()}
     import threading
 
     store = ProxyStateStore(str(f), state, threading.Lock(), SwarmConfig())

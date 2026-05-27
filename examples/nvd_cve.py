@@ -32,16 +32,21 @@ To build your own use case, implement the `UseCase` protocol and write a
 class for `NvdCveUseCase`, then call `proxyswarm.run(your_use_case)`.
 """
 
-import os
-import json
 import argparse
+import contextlib
+import json
+import os
 import threading
-from typing import Iterator
+from pathlib import Path
+from typing import TYPE_CHECKING
 
 import requests
 from loguru import logger
 
-from proxyswarm import SwarmConfig, FetchOutcome, RequestSpec, UseCase, run
+from proxyswarm import FetchOutcome, RequestSpec, SwarmConfig, UseCase, run
+
+if TYPE_CHECKING:
+    from collections.abc import Iterator
 
 
 # ---------------------------------------------------------------------------
@@ -82,6 +87,7 @@ class NvdCveUseCase:
 
     @classmethod
     def add_arguments(cls, p: argparse.ArgumentParser) -> None:
+        """Register the NVD-specific CLI flags onto the framework parser."""
         p.add_argument(
             "--year",
             type=int,
@@ -103,20 +109,25 @@ class NvdCveUseCase:
         p.add_argument(
             "--store",
             default=DEFAULT_NVD_STORE,
-            help=f"Destination folder for fetched CVE JSON. Default: {DEFAULT_NVD_STORE}.",
+            help="Destination folder for fetched CVE JSON. "
+            f"Default: {DEFAULT_NVD_STORE}.",
         )
         p.add_argument(
             "--api-key",
             default=DEFAULT_NVD_API_KEY,
-            help="NVD API key (optional). Defaults to the NVD_API_KEY environment variable.",
+            help="NVD API key (optional). Defaults to the NVD_API_KEY "
+            "environment variable.",
         )
 
     @classmethod
-    def from_args(cls, args: argparse.Namespace) -> "NvdCveUseCase":
+    def from_args(cls, args: argparse.Namespace) -> NvdCveUseCase:
+        """Validate the range arguments and construct the use case."""
         if args.count < 1:
-            raise SystemExit(f"--count must be >= 1, got {args.count}")
+            msg = f"--count must be >= 1, got {args.count}"
+            raise SystemExit(msg)
         if args.start < 1:
-            raise SystemExit(f"--start must be >= 1, got {args.start}")
+            msg = f"--start must be >= 1, got {args.start}"
+            raise SystemExit(msg)
         return cls(args.year, args.start, args.count, args.store, args.api_key)
 
     def __init__(
@@ -126,7 +137,8 @@ class NvdCveUseCase:
         count: int,
         store_folder: str,
         api_key: str | None,
-    ):
+    ) -> None:
+        """Store the year, sequence range, destination folder, and API key."""
         self.year = year
         self.start = start
         self.count = count
@@ -137,21 +149,24 @@ class NvdCveUseCase:
         self.name = f"nvd-cve:{year}"
 
     def prepare(self) -> None:
-        os.makedirs(self.store_folder, exist_ok=True)
+        """Create the store folder and sweep stale partials from a prior run."""
+        store = Path(self.store_folder)
+        store.mkdir(parents=True, exist_ok=True)
         # Sweep stale partials left over from a previously-killed write. They're
         # dot-prefixed so they don't pollute the dedup set, but they're wasted disk.
         stale = 0
-        for name in os.listdir(self.store_folder):
-            if name.startswith(".partial."):
-                try:
-                    os.unlink(os.path.join(self.store_folder, name))
+        for entry in store.iterdir():
+            if entry.name.startswith(".partial."):
+                with contextlib.suppress(OSError):
+                    entry.unlink()
                     stale += 1
-                except OSError:
-                    pass
         if stale:
-            logger.info("Cleaned {} stale partial files in {}", stale, self.store_folder)
+            logger.info(
+                "Cleaned {} stale partial files in {}", stale, self.store_folder
+            )
 
     def session_headers(self) -> dict[str, str]:
+        """Return the apiKey header when a key is set, else no headers."""
         # NVD reads the key from the `apiKey` header. Omit it entirely when
         # unset — sending an empty key is treated as malformed by some edges.
         return {"apiKey": self.api_key} if self.api_key else {}
@@ -167,16 +182,18 @@ class NvdCveUseCase:
             yield f"CVE-{self.year}-{n:04d}"
 
     def existing_ids(self) -> set[str]:
+        """Return the bare CVE IDs already saved as `<id>.json`."""
         # Hits are saved as `<cve-id>.json`, so strip the `.json` suffix to get
         # the bare ID the per-item dedup check compares against. Skip
         # dot-prefixed names so in-progress `.partial.*` files don't show up.
         return {
-            name[: -len(".json")]
-            for name in os.listdir(self.store_folder)
-            if name.endswith(".json") and not name.startswith(".")
+            entry.name[: -len(".json")]
+            for entry in Path(self.store_folder).iterdir()
+            if entry.name.endswith(".json") and not entry.name.startswith(".")
         }
 
     def build_request(self, item_id: str) -> RequestSpec:
+        """Build the NVD GET request for one CVE ID (id as a query param)."""
         # GET with the CVE ID as a query param. The framework adds the proxy,
         # session headers, stream=True, and the timeout — see RequestSpec.
         return RequestSpec(
@@ -184,6 +201,28 @@ class NvdCveUseCase:
             method="GET",
             params={"cveId": item_id},
         )
+
+    @staticmethod
+    def _classify_body(body: bytes) -> tuple[FetchOutcome, str | None, bytes]:
+        # Decode an already-read 200 body into an outcome. Split out from
+        # `classify` so the transport-read concerns (stream errors, the
+        # oversized cap) stay separate from JSON-shape classification.
+        if not body:
+            return FetchOutcome.PROXY_GARBAGE, "empty body", body
+        try:
+            data = json.loads(body)
+        except ValueError:
+            # 200 but not JSON — a captive portal or proxy error page.
+            return FetchOutcome.PROXY_GARBAGE, f"non-json ({len(body)}B)", body
+        # A genuine NVD response always carries `totalResults`. Its absence
+        # means this 200 came from something other than NVD (a proxy that
+        # rewrote the response, an unexpected redirect target, etc.).
+        if not isinstance(data, dict) or "totalResults" not in data:
+            return FetchOutcome.PROXY_GARBAGE, "not an NVD response", body
+        if data.get("totalResults", 0) >= 1 and data.get("vulnerabilities"):
+            return FetchOutcome.OK, None, body
+        # Valid query, but NVD has no such CVE — authoritative, don't retry.
+        return FetchOutcome.NOT_FOUND, "totalResults=0", body
 
     def classify(
         self, response: requests.Response
@@ -233,24 +272,7 @@ class NvdCveUseCase:
 
             if oversized:
                 return FetchOutcome.PROXY_GARBAGE, "oversized body", bytes(buf)
-
-            body = bytes(buf)
-            if not body:
-                return FetchOutcome.PROXY_GARBAGE, "empty body", body
-            try:
-                data = json.loads(body)
-            except ValueError:
-                # 200 but not JSON — a captive portal or proxy error page.
-                return FetchOutcome.PROXY_GARBAGE, f"non-json ({len(body)}B)", body
-            # A genuine NVD response always carries `totalResults`. Its absence
-            # means this 200 came from something other than NVD (a proxy that
-            # rewrote the response, an unexpected redirect target, etc.).
-            if not isinstance(data, dict) or "totalResults" not in data:
-                return FetchOutcome.PROXY_GARBAGE, "not an NVD response", body
-            if data.get("totalResults", 0) >= 1 and data.get("vulnerabilities"):
-                return FetchOutcome.OK, None, body
-            # Valid query, but NVD has no such CVE — authoritative, don't retry.
-            return FetchOutcome.NOT_FOUND, "totalResults=0", body
+            return self._classify_body(bytes(buf))
         finally:
             response.close()
 
@@ -267,31 +289,29 @@ class NvdCveUseCase:
         try:
             json.loads(body)
         except ValueError:
-            logger.warning("Body for {} did not parse as JSON ({}B)", item_id, len(body))
+            logger.warning(
+                "Body for {} did not parse as JSON ({}B)", item_id, len(body)
+            )
             return False
 
-        target = os.path.join(self.store_folder, f"{item_id}.json")
+        store = Path(self.store_folder)
+        target = store / f"{item_id}.json"
         # Write to a hidden per-thread partial and rename atomically. Guarantees:
         #   1. A killed mid-write never leaves a partial `<id>.json` the dedup
         #      check would treat as complete — partials are dot-prefixed, and
         #      existing_ids skips dot-prefixed names.
         #   2. Concurrent workers fetching the same ID can't see a half-written
-        #      file — os.replace is atomic.
-        partial = os.path.join(
-            self.store_folder,
-            f".partial.{os.getpid()}.{threading.get_ident()}.{item_id}.json",
+        #      file — Path.replace is atomic.
+        partial = (
+            store / f".partial.{os.getpid()}.{threading.get_ident()}.{item_id}.json"
         )
         try:
-            with open(partial, "wb") as f:
+            with partial.open("wb") as f:
                 f.write(body)
-            os.replace(partial, target)
+            partial.replace(target)
         except OSError as e:
             logger.warning("Could not write {}: {}", target, e)
-            if os.path.exists(partial):
-                try:
-                    os.unlink(partial)
-                except OSError:
-                    pass
+            partial.unlink(missing_ok=True)
             return False
         return True
 

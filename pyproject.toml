@@ -20,10 +20,99 @@ build-backend = "uv_build"
 
 [dependency-groups]
 dev = [
-    "mypy>=2.1.0",
     "pytest>=8.3.0",
     "ruff>=0.15.14",
+    "ty>=0.0.39",
 ]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+
+# ---------------------------------------------------------------------------
+# Ruff — strict linting + formatting.
+# `select = ["ALL"]` opts into every stable rule; the `ignore` list below is the
+# small, deliberate set of rules that either conflict with the formatter or are
+# wrong for this codebase. Each carries its rationale so a future reader knows
+# the ignore is a decision, not an oversight.
+# ---------------------------------------------------------------------------
+[tool.ruff]
+target-version = "py314"
+line-length = 88
+src = ["src", "tests", "examples"]
+
+[tool.ruff.lint]
+select = ["ALL"]
+ignore = [
+    # -- Formatter conflicts (Ruff itself recommends disabling these when using
+    #    `ruff format`; otherwise lint and format fight each other). --
+    "COM812", # missing-trailing-comma — the formatter owns trailing commas
+    "ISC001", # single-line-implicit-string-concatenation — formatter-managed
+
+    # -- Deliberate prose style. The comments and docstrings use real typographic
+    #    punctuation (em dash "—", arrow "→"). These read better than ASCII and
+    #    are intentional throughout, so the "ambiguous character" rules are noise. --
+    "RUF001", # ambiguous-unicode-character-string
+    "RUF002", # ambiguous-unicode-character-docstring
+    "RUF003", # ambiguous-unicode-character-comment
+
+    # -- Over-engineering for this project's scale. TRY003 would push every
+    #    `raise ValueError(f"...")` in config validation toward a bespoke
+    #    exception subclass; for a handful of construction-time guards that is
+    #    more indirection than it buys. --
+    "TRY003", # raise-vanilla-args
+]
+
+[tool.ruff.lint.pydocstyle]
+# pep257 resolves the mutually-exclusive docstring rules (D203/D211, D212/D213)
+# so they don't have to be hand-ignored.
+convention = "pep257"
+
+[tool.ruff.lint.pylint]
+# The DI constructors (`Downloader`, `ProxyStateStore`) and the metrics reporter
+# legitimately take 6–7 collaborators; bundling them into a parameter object
+# would hurt clarity more than it helps. Raise the bar rather than ignore PLR0913.
+max-args = 8
+
+[tool.ruff.lint.per-file-ignores]
+# Tests assert on internals and use bare values by design.
+"tests/**" = [
+    "S101",    # assert — pytest's core idiom
+    "S104",    # "0.0.0.0" etc. as test data, not a real bind address
+    "SLF001",  # private-member-access — tests exercise internal state directly
+    "PLR2004", # magic-value-comparison — literal expectations are the point
+    "ANN",     # missing type annotations on test functions/fixtures
+    "D",       # docstrings not required for test functions
+    "ARG",     # unused args (fixtures, monkeypatch stubs)
+    "INP001",  # tests/ is intentionally not a package
+    "PLC0415", # import-outside-top-level (lazy imports inside tests are fine)
+]
+# `examples/` is a standalone script directory run via `python -m`, not an
+# installed package — so namespace-package and import-time concerns don't apply.
+"examples/**" = [
+    "INP001", # implicit-namespace-package — examples/ is deliberately not a package
+]
+
+# ---------------------------------------------------------------------------
+# ty — strict type checking (replaces mypy).
+# `all = "error"` promotes every rule to error severity, and
+# `error-on-warning` makes any residual warning fail CI too. The result is the
+# strictest posture ty currently offers.
+# ---------------------------------------------------------------------------
+[tool.ty.environment]
+python-version = "3.14"
+python = ".venv"
+# "all" makes no assumption about the host platform, so platform-gated code is
+# checked under every `sys.platform` rather than just the developer's OS.
+python-platform = "all"
+# `examples/` is a script dir put on sys.path at runtime by tests/conftest.py;
+# mirror that here so ty can resolve `import malware_bazaar` statically.
+extra-paths = ["examples"]
+
+[tool.ty.src]
+include = ["src", "tests", "examples"]
+
+[tool.ty.rules]
+all = "error"
+
+[tool.ty.terminal]
+error-on-warning = true
