@@ -7,9 +7,13 @@ atomic, corrupt-safe write. Non-2xx handling lives in the framework
 """
 
 import json
+from typing import TYPE_CHECKING, cast
 
 import nvd_cve as nv  # from examples/, via conftest sys.path insert
 from proxyswarm import FetchOutcome
+
+if TYPE_CHECKING:
+    import requests
 
 
 class FakeResponse:
@@ -30,14 +34,15 @@ class FakeResponse:
         self.closed = True
 
 
-def make_use_case(store: str) -> "nv.NvdCveUseCase":
+def make_use_case(store: str) -> nv.NvdCveUseCase:
     return nv.NvdCveUseCase(2024, 1, 10, store, api_key=None)
 
 
 def classify(*chunks: bytes):
     uc = make_use_case("unused")
     resp = FakeResponse(*chunks)
-    outcome, detail, body = uc.classify(resp)
+    # FakeResponse duck-types only what classify touches (iter_content/close).
+    outcome, detail, body = uc.classify(cast("requests.Response", resp))
     assert resp.closed, "classify must close the response in its finally"
     return outcome, detail, body
 

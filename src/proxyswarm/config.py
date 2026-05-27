@@ -1,8 +1,17 @@
+"""Runtime tuning knobs for the proxy swarm, with construction-time validation."""
+
 import dataclasses
 
 
 @dataclasses.dataclass
 class SwarmConfig:
+    """Tunable parameters for `ProxyPool`, `Downloader`, and the orchestrator.
+
+    All fields have working defaults; `__post_init__` rejects out-of-range
+    values (negative counts, fractions outside [0, 1], inverted min/max pairs)
+    so misconfiguration fails at construction rather than deep into a run.
+    """
+
     workers: int = 100
     request_timeout_sec: int = 4
     max_retry_attempts: int = 40
@@ -53,26 +62,30 @@ class SwarmConfig:
     )
 
     def __post_init__(self) -> None:
+        """Validate ranges, raising ValueError on any illegal field."""
         # Validate at construction so misconfiguration fails loudly and early
         # rather than as a negative slice or a ThreadPoolExecutor ValueError
         # deep into a run.
         for field in self._FRACTION_FIELDS:
             value = getattr(self, field)
             if not 0.0 <= value <= 1.0:
-                raise ValueError(f"{field} must be in [0, 1], got {value}")
+                msg = f"{field} must be in [0, 1], got {value}"
+                raise ValueError(msg)
         if self.workers < 1:
-            raise ValueError(f"workers must be >= 1, got {self.workers}")
+            msg = f"workers must be >= 1, got {self.workers}"
+            raise ValueError(msg)
         if self.top_k_fast_lane < 1:
-            raise ValueError(
-                f"top_k_fast_lane must be >= 1, got {self.top_k_fast_lane}"
-            )
+            msg = f"top_k_fast_lane must be >= 1, got {self.top_k_fast_lane}"
+            raise ValueError(msg)
         if self.min_retry_attempts > self.max_retry_attempts:
-            raise ValueError(
+            msg = (
                 f"min_retry_attempts ({self.min_retry_attempts}) must be "
                 f"<= max_retry_attempts ({self.max_retry_attempts})"
             )
+            raise ValueError(msg)
         if self.cooldown_base_sec > self.cooldown_max_sec:
-            raise ValueError(
+            msg = (
                 f"cooldown_base_sec ({self.cooldown_base_sec}) must be "
                 f"<= cooldown_max_sec ({self.cooldown_max_sec})"
             )
+            raise ValueError(msg)

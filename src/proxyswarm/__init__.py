@@ -1,8 +1,10 @@
+"""proxyswarm — free-proxy-pool bulk fetcher with a pluggable use-case API."""
+
 from .config import SwarmConfig
 from .core import (
-    ProxyPool,
     Downloader,
     FetchOutcome,
+    ProxyPool,
     RequestSpec,
     UseCase,
     analyze_data,
@@ -10,11 +12,11 @@ from .core import (
 )
 
 __all__ = [
-    "SwarmConfig",
-    "ProxyPool",
     "Downloader",
     "FetchOutcome",
+    "ProxyPool",
     "RequestSpec",
+    "SwarmConfig",
     "UseCase",
     "analyze_data",
     "run",
