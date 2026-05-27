@@ -7,7 +7,7 @@ from collections import deque
 from concurrent.futures import ThreadPoolExecutor, wait, FIRST_COMPLETED
 from enum import StrEnum
 from typing import Iterator, NamedTuple, Protocol, TypedDict
-from tqdm import tqdm  # type: ignore
+from tqdm import tqdm
 from loguru import logger
 import os
 import time

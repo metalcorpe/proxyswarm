@@ -60,7 +60,10 @@ if __name__ == "__main__":
     run(use_case, config)
 ```
 
-See `examples/malware_bazaar.py` for a full advanced implementation that was used to pull down gigabytes from abuse.ch.
+Two worked examples ship in `examples/`:
+
+- **`nvd_cve.py`** — a plain rate-limited REST/JSON case: `GET` each CVE record from the NVD API (per-IP rate limit is the reason to spread across proxies), classify by the 200 body, and save the JSON. Good starting point for your own use case.
+- **`malware_bazaar.py`** — a full advanced implementation that was used to pull down gigabytes from abuse.ch: `POST` form data, an API that returns HTTP 200 + in-band JSON errors, and AES-encrypted zip extraction.
 
 ## Configuration
 
