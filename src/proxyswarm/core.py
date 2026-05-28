@@ -79,6 +79,7 @@ from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from enum import StrEnum
 from pathlib import Path
 from typing import TYPE_CHECKING, ClassVar, NamedTuple, Protocol, TypedDict
+from urllib.parse import urlsplit
 
 import requests
 from loguru import logger
@@ -86,6 +87,7 @@ from requests.adapters import HTTPAdapter
 from tqdm import tqdm
 
 from .config import SwarmConfig
+from .health import check_proxies
 from .scraper import scrape_proxies
 
 if TYPE_CHECKING:
@@ -915,29 +917,68 @@ def _is_bogus_proxy_host(host: str) -> bool:
     return not ip.is_global
 
 
+def _is_parseable_proxy(proxy: str) -> bool:
+    """Return True if `proxy` yields a host and an in-range port via `urlsplit`.
+
+    `SplitResult.port` validates lazily and raises ValueError on a port outside
+    0-65535 or a non-numeric port. An entry that can't produce a usable
+    host:port is dropped at load so it can't crash a consumer that parses it
+    later (the pre-flight health check, the downloader).
+    """
+    try:
+        parsed = urlsplit(proxy)
+        host, port = parsed.hostname, parsed.port
+    except ValueError:
+        return False
+    return bool(host) and port is not None
+
+
+def _normalize_proxy_line(line: str) -> str | None:
+    """Normalise one stripped proxy line to `scheme://host:port`, or None to skip.
+
+    Skips blanks and `#` comments; schemes bare `host:port` entries (see
+    `_classify_proxy_scheme`) and drops them if the host is a non-routable IP
+    literal (see `_is_bogus_proxy_host`). Structural port-range validation is
+    left to the caller so malformed entries can be counted separately.
+    """
+    if not line or line.startswith("#"):
+        return None
+    if "://" not in line:
+        host, _, port = line.partition(":")
+        if not host or not port or _is_bogus_proxy_host(host):
+            return None
+        line = f"{_classify_proxy_scheme(port)}://{host}:{port}"
+    return line
+
+
 def _read_proxy_file(path: str) -> list[str]:
     """Parse a proxy file into normalised `scheme://host:port` entries.
 
     Blank lines and `#` comments are skipped. Bare `host:port` entries gain a
-    scheme (see `_classify_proxy_scheme`) and are dropped if the host is a
-    non-routable IP literal (see `_is_bogus_proxy_host`). A missing or empty
-    file yields an empty list.
+    scheme and non-routable IP literals are dropped (see `_normalize_proxy_line`).
+    Entries whose host:port can't be parsed back out are dropped and counted
+    (see `_is_parseable_proxy`). A missing or empty file yields an empty list.
     """
     if not Path(path).exists() or Path(path).stat().st_size == 0:
         return []
 
     out: list[str] = []
+    malformed = 0
     with Path(path).open(encoding="utf-8") as f:
         for raw in f:
-            line = raw.strip()
-            if not line or line.startswith("#"):
+            line = _normalize_proxy_line(raw.strip())
+            if line is None:
                 continue
-            if "://" not in line:
-                host, _, port = line.partition(":")
-                if not host or not port or _is_bogus_proxy_host(host):
-                    continue
-                line = f"{_classify_proxy_scheme(port)}://{host}:{port}"
+            if not _is_parseable_proxy(line):
+                malformed += 1
+                continue
             out.append(line)
+    if malformed:
+        logger.warning(
+            "Dropped {} malformed proxy entries (unparseable host:port) from {}",
+            malformed,
+            path,
+        )
     return out
 
 
@@ -988,6 +1029,37 @@ def _load_proxies(path: str) -> list[str | None]:
     random.shuffle(deduped)
     logger.info("Loaded {} proxies ({} unique, shuffled)", len(out), len(deduped))
     return deduped
+
+
+def _warm_seed_pool(pool: ProxyPool, latencies: dict[str, float]) -> None:
+    """Promote pre-flight-verified proxies into the pool's known-good set.
+
+    Each alive proxy is credited via `mark_success` with its measured latency,
+    so the fast lane starts populated and EWMA-ordered rather than cold-walking
+    the slow lane to rediscover proxies the health check already confirmed.
+    """
+    for proxy, latency_ms in latencies.items():
+        pool.mark_success(proxy, elapsed_ms=latency_ms)
+
+
+def _maybe_warm_seed(pool: ProxyPool, config: SwarmConfig) -> None:
+    """Pre-flight liveness-check the pool's proxies and warm-seed the live ones.
+
+    No-op when `config.health_check_enabled` is False. Otherwise validates every
+    loaded proxy concurrently (see `proxyswarm.health.check_proxies`) and feeds
+    the confirmed-live ones — with their measured latency — into the fast lane.
+    """
+    if not config.health_check_enabled:
+        return
+    latencies = check_proxies(
+        pool.proxies,
+        test_url=config.health_check_url,
+        concurrency=config.health_check_concurrency,
+        connect_timeout=config.health_check_connect_timeout_sec,
+        read_timeout=config.health_check_read_timeout_sec,
+        target_alive=config.health_check_target_alive,
+    )
+    _warm_seed_pool(pool, latencies)
 
 
 class RequestSpec(NamedTuple):
@@ -1651,6 +1723,7 @@ def _build_runtime(use_case: UseCase, config: SwarmConfig) -> Downloader:
     proxy_pool = ProxyPool(
         _load_proxies(config.proxies_file), config, state_file=config.proxy_state_file
     )
+    _maybe_warm_seed(proxy_pool, config)
 
     use_case.prepare()
     existing_ids = use_case.existing_ids()

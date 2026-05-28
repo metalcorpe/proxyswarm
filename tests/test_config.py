@@ -48,3 +48,32 @@ def test_retry_attempt_ordering() -> None:
 def test_cooldown_ordering() -> None:
     with pytest.raises(ValueError, match="cooldown_base_sec"):
         SwarmConfig(cooldown_base_sec=99_999_999, cooldown_max_sec=10)
+
+
+def test_health_check_concurrency_must_be_positive() -> None:
+    with pytest.raises(ValueError, match="health_check_concurrency must be >= 1"):
+        SwarmConfig(health_check_concurrency=0)
+
+
+def test_health_check_target_alive_must_be_non_negative() -> None:
+    with pytest.raises(ValueError, match="health_check_target_alive must be >= 0"):
+        SwarmConfig(health_check_target_alive=-1)
+
+
+def test_health_check_target_alive_zero_is_allowed() -> None:
+    # 0 = exhaustive (no early stop); a legal, supported configuration.
+    assert SwarmConfig(health_check_target_alive=0).health_check_target_alive == 0
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"health_check_connect_timeout_sec": 0.0},
+        {"health_check_connect_timeout_sec": -1.0},
+        {"health_check_read_timeout_sec": 0.0},
+        {"health_check_read_timeout_sec": -2.0},
+    ],
+)
+def test_health_check_timeouts_must_be_positive(kwargs: dict) -> None:
+    with pytest.raises(ValueError, match="must be > 0"):
+        SwarmConfig(**kwargs)

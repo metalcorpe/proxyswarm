@@ -16,6 +16,46 @@ def make_pool() -> ProxyPool:
 # --- accounting contract -----------------------------------------------------
 
 
+def test_warm_seed_promotes_only_alive_proxies_with_latency() -> None:
+    pool = make_pool()
+    core._warm_seed_pool(pool, {P1: 123.0})
+    # P1 was reported alive → promoted into the known-good set with its latency
+    # seeded into the EWMA; P2 was not in the alive map → untouched.
+    assert P1 in pool.good_candidates
+    assert pool.state[P1]["ewma_ms"] == 123.0
+    assert P2 not in pool.good_candidates
+
+
+def test_maybe_warm_seed_checks_loaded_proxies_and_seeds_when_enabled(
+    monkeypatch,
+) -> None:
+    pool = make_pool()
+    captured: dict[str, list[str | None]] = {}
+
+    def fake_check(proxies: list[str | None], **_kw: object) -> dict[str, float]:
+        captured["proxies"] = proxies
+        return {P1: 42.0}
+
+    monkeypatch.setattr(core, "check_proxies", fake_check)
+    core._maybe_warm_seed(pool, SwarmConfig(health_check_enabled=True))
+
+    assert set(captured["proxies"]) == {P1, P2}  # the pool's loaded proxies
+    assert P1 in pool.good_candidates
+    assert pool.state[P1]["ewma_ms"] == 42.0
+
+
+def test_maybe_warm_seed_is_a_noop_when_disabled(monkeypatch) -> None:
+    pool = make_pool()
+
+    def boom(*_a: object, **_k: object) -> dict[str, float]:
+        msg = "check_proxies must not run when health_check_enabled is False"
+        raise AssertionError(msg)
+
+    monkeypatch.setattr(core, "check_proxies", boom)
+    core._maybe_warm_seed(pool, SwarmConfig(health_check_enabled=False))
+    assert not pool.good_candidates
+
+
 def test_acquire_increments_attempts_and_usage() -> None:
     pool = make_pool()
     p = pool.acquire()

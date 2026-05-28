@@ -49,6 +49,21 @@ class SwarmConfig:
 
     metrics_interval_sec: int = 30
 
+    # Pre-flight liveness check (see `proxyswarm.health`). When enabled, scraped/
+    # loaded proxies are validated concurrently before the run and the live ones
+    # warm-seed the fast lane via `mark_success`. Disable to skip the up-front
+    # cost and let the pool discover good proxies lazily during real work.
+    health_check_enabled: bool = True
+    health_check_concurrency: int = 1000
+    health_check_connect_timeout_sec: float = 3.0
+    health_check_read_timeout_sec: float = 4.0
+    health_check_url: str = "http://www.gstatic.com/generate_204"
+    # Stop the pre-flight check once this many live proxies are found — enough to
+    # warm-seed the fast lane without validating the whole (mostly-dead) list.
+    # Since the proxy list is shuffled at load, the checked prefix is an unbiased
+    # sample. 0 = exhaustive (check every proxy).
+    health_check_target_alive: int = 500
+
     # Fields constrained to the [0, 1] interval. Out-of-range values silently
     # corrupt the lane slot math (e.g. exploration_fraction > 1 makes
     # exploitation_budget negative and `usable[:negative]` a wrong slice).
@@ -89,3 +104,27 @@ class SwarmConfig:
                 f"<= cooldown_max_sec ({self.cooldown_max_sec})"
             )
             raise ValueError(msg)
+        self._validate_health_check()
+
+    def _validate_health_check(self) -> None:
+        """Validate the pre-flight health-check knobs (see `proxyswarm.health`)."""
+        if self.health_check_concurrency < 1:
+            msg = (
+                f"health_check_concurrency must be >= 1, "
+                f"got {self.health_check_concurrency}"
+            )
+            raise ValueError(msg)
+        if self.health_check_target_alive < 0:
+            msg = (
+                f"health_check_target_alive must be >= 0, "
+                f"got {self.health_check_target_alive}"
+            )
+            raise ValueError(msg)
+        for field in (
+            "health_check_connect_timeout_sec",
+            "health_check_read_timeout_sec",
+        ):
+            value = getattr(self, field)
+            if value <= 0:
+                msg = f"{field} must be > 0, got {value}"
+                raise ValueError(msg)
