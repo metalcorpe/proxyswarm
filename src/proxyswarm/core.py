@@ -86,6 +86,7 @@ from requests.adapters import HTTPAdapter
 from tqdm import tqdm
 
 from .config import SwarmConfig
+from .scraper import scrape_proxies
 
 if TYPE_CHECKING:
     import argparse
@@ -914,10 +915,17 @@ def _is_bogus_proxy_host(host: str) -> bool:
     return not ip.is_global
 
 
-def _load_proxies(path: str) -> list[str | None]:
-    if not Path(path).exists():
-        logger.warning("No proxies file at {}, running without proxies", path)
-        return [None]
+def _read_proxy_file(path: str) -> list[str]:
+    """Parse a proxy file into normalised `scheme://host:port` entries.
+
+    Blank lines and `#` comments are skipped. Bare `host:port` entries gain a
+    scheme (see `_classify_proxy_scheme`) and are dropped if the host is a
+    non-routable IP literal (see `_is_bogus_proxy_host`). A missing or empty
+    file yields an empty list.
+    """
+    if not Path(path).exists() or Path(path).stat().st_size == 0:
+        return []
+
     out: list[str] = []
     with Path(path).open(encoding="utf-8") as f:
         for raw in f:
@@ -926,12 +934,46 @@ def _load_proxies(path: str) -> list[str | None]:
                 continue
             if "://" not in line:
                 host, _, port = line.partition(":")
-                # Drop empty host/port and non-routable IP literals (loopback,
-                # private, unspecified, ...) — see `_is_bogus_proxy_host`.
                 if not host or not port or _is_bogus_proxy_host(host):
                     continue
                 line = f"{_classify_proxy_scheme(port)}://{host}:{port}"
             out.append(line)
+    return out
+
+
+def _scrape_proxies_to_file(path: str) -> list[str]:
+    """Scrape public sources, persist them to `path`, and re-read the result.
+
+    Re-reading routes scraped proxies through the same classification and
+    routability filters as a user-supplied file, so there's no validation
+    bypass. Returns an empty list if scraping yields nothing or the write fails.
+    """
+    logger.warning(
+        "No proxies found in {}, attempting to scrape from public sources...", path
+    )
+    scraped = scrape_proxies()
+    if not scraped:
+        return []
+    try:
+        with Path(path).open("w", encoding="utf-8") as f:
+            f.writelines(p + "\n" for p in scraped)
+    except OSError as e:
+        logger.error("Failed to write scraped proxies to {}: {}", path, e)
+        return []
+    logger.info("Saved {} scraped proxies to {}", len(scraped), path)
+    return _read_proxy_file(path)
+
+
+def _load_proxies(path: str) -> list[str | None]:
+    out = _read_proxy_file(path) or _scrape_proxies_to_file(path)
+
+    if not out:
+        logger.warning(
+            "No proxies in {} and scraping yielded nothing, running without proxies",
+            path,
+        )
+        return [None]
+
     # Dedup, then shuffle. Shuffling spreads the slow-lane discovery walk across
     # the file's contents — if the file is sorted (by country / ASN / scraper
     # source), an unshuffled walk would hit correlated batches and either find
