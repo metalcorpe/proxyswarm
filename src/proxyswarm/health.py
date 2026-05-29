@@ -100,14 +100,14 @@ async def _probe_http(
         reader, writer = await asyncio.wait_for(
             asyncio.open_connection(host, port), timeout=connect_timeout
         )
-    except (OSError, TimeoutError):
+    except OSError, TimeoutError:
         return None
 
     try:
         writer.write(request)
         await asyncio.wait_for(writer.drain(), timeout=read_timeout)
         status_line = await asyncio.wait_for(reader.readline(), timeout=read_timeout)
-    except (OSError, TimeoutError):
+    except OSError, TimeoutError:
         return None
     finally:
         await _close(writer)
@@ -129,7 +129,7 @@ async def _probe_tcp(host: str, port: int, *, connect_timeout: float) -> float |
         _reader, writer = await asyncio.wait_for(
             asyncio.open_connection(host, port), timeout=connect_timeout
         )
-    except (OSError, TimeoutError):
+    except OSError, TimeoutError:
         return None
     await _close(writer)
     return _elapsed_ms(start)
