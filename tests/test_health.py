@@ -130,7 +130,6 @@ def _check(
         connect_timeout=connect_timeout,
         read_timeout=read_timeout,
         target_alive=target_alive,
-        show_progress=False,
     )
 
 

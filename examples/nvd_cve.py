@@ -43,7 +43,7 @@ from typing import TYPE_CHECKING
 import requests
 from loguru import logger
 
-from proxyswarm import FetchOutcome, RequestSpec, SwarmConfig, UseCase, run
+from proxyswarm import FetchOutcome, RequestSpec, SwarmConfig, run
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
@@ -317,7 +317,7 @@ class NvdCveUseCase:
 
 
 def _parse_args(
-    use_case_cls: type[UseCase], argv: list[str] | None = None
+    use_case_cls: type[NvdCveUseCase], argv: list[str] | None = None
 ) -> argparse.Namespace:
     p = argparse.ArgumentParser(
         description=f"Free-proxy-pool bulk fetcher (use case: {use_case_cls.name}).",

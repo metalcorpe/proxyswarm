@@ -91,7 +91,6 @@ from .health import check_proxies
 from .scraper import scrape_proxies
 
 if TYPE_CHECKING:
-    import argparse
     from collections.abc import Iterator
 
 
@@ -1097,26 +1096,23 @@ class UseCase(Protocol):
       and returns True on success. Returning False signals "body looked
       right but was corrupt" — the framework cools the proxy and retries.
 
-    Lifecycle: `add_arguments` is called once during CLI parsing,
-    `from_args` constructs the instance, `prepare` runs before the worker
-    pool starts (mkdirs, partial cleanup, fetching a CSV index, etc),
-    `session_headers` is mounted on the shared `requests.Session`.
+    Construction is the caller's concern, not the framework's: `run` takes an
+    already-built instance. The shipped examples parse argv into one with a
+    per-use-case `main`/`_parse_args` pair (see `examples/`), but that's a CLI
+    convention, not part of this contract.
+
+    Lifecycle: `prepare` runs once before the worker pool starts — whatever
+    one-time setup the use case owns (mkdirs, partial cleanup, fetching a CSV
+    index, etc); `session_headers` is mounted on the shared `requests.Session`;
+    then `iter_items`/`build_request`/`classify`/`handle_success` drive each
+    item. The framework provides the proxy swarm and retry loop only — where a
+    fetched body is persisted is entirely the use case's concern.
 
     The `name` attribute is used in log messages so different invocations
     can be told apart at a glance.
     """
 
     name: str
-
-    @classmethod
-    def add_arguments(cls, p: argparse.ArgumentParser) -> None:
-        """Register the use case's CLI flags onto the framework parser."""
-        ...
-
-    @classmethod
-    def from_args(cls, args: argparse.Namespace) -> UseCase:
-        """Construct the use case from parsed CLI arguments."""
-        ...
 
     def prepare(self) -> None:
         """Run any one-time setup before the worker pool starts."""
