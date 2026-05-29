@@ -2,7 +2,7 @@
 daily cap, EWMA updates, and disk-load coercion. All pure-unit; `time.time` is
 monkeypatched where the math depends on it."""
 
-from proxyswarm import ProxyPool, SwarmConfig, core
+from proxyswarm import ProxyPool, SwarmConfig, core, orchestrator
 
 P1 = "http://1.1.1.1:8080"
 P2 = "http://2.2.2.2:8080"
@@ -36,8 +36,8 @@ def test_maybe_warm_seed_checks_loaded_proxies_and_seeds_when_enabled(
         captured["proxies"] = proxies
         return {P1: 42.0}
 
-    monkeypatch.setattr(core, "check_proxies", fake_check)
-    core._maybe_warm_seed(pool, SwarmConfig(health_check_enabled=True))
+    monkeypatch.setattr(orchestrator, "check_proxies", fake_check)
+    orchestrator._maybe_warm_seed(pool, SwarmConfig(health_check_enabled=True))
 
     assert set(captured["proxies"]) == {P1, P2}  # the pool's loaded proxies
     assert P1 in pool.good_candidates
@@ -51,8 +51,8 @@ def test_maybe_warm_seed_is_a_noop_when_disabled(monkeypatch) -> None:
         msg = "check_proxies must not run when health_check_enabled is False"
         raise AssertionError(msg)
 
-    monkeypatch.setattr(core, "check_proxies", boom)
-    core._maybe_warm_seed(pool, SwarmConfig(health_check_enabled=False))
+    monkeypatch.setattr(orchestrator, "check_proxies", boom)
+    orchestrator._maybe_warm_seed(pool, SwarmConfig(health_check_enabled=False))
     assert not pool.good_candidates
 
 
