@@ -19,77 +19,7 @@ from json import JSONDecodeError
 import requests
 from loguru import logger
 
-# `type` picks the parser: "text"/"regex" sources are scraped with PROXY_REGEX;
-# "geonode" returns JSON and needs structured extraction.
-SOURCES: list[dict[str, str]] = [
-    {
-        "url": "https://raw.githubusercontent.com/TheSpeedX/PROXY-List/master/http.txt",
-        "type": "text",
-    },
-    {
-        "url": "https://raw.githubusercontent.com/TheSpeedX/PROXY-List/master/socks4.txt",
-        "type": "text",
-    },
-    {
-        "url": "https://raw.githubusercontent.com/TheSpeedX/PROXY-List/master/socks5.txt",
-        "type": "text",
-    },
-    {
-        "url": "https://api.proxyscrape.com/v4/free-proxy-list/get"
-        "?request=display_proxies&proxy_format=protocolipport&format=text",
-        "type": "text",
-    },
-    {
-        "url": "https://raw.githubusercontent.com/Thordata/awesome-free-proxy-list"
-        "/main/proxies/all.txt",
-        "type": "text",
-    },
-    {
-        "url": "https://raw.githubusercontent.com/Thordata/awesome-free-proxy-list"
-        "/main/proxies/http.txt",
-        "type": "text",
-    },
-    {
-        "url": "https://raw.githubusercontent.com/Thordata/awesome-free-proxy-list"
-        "/main/proxies/top-http.txt",
-        "type": "text",
-    },
-    {
-        "url": "https://raw.githubusercontent.com/Thordata/awesome-free-proxy-list"
-        "/main/proxies/socks5.txt",
-        "type": "text",
-    },
-    {
-        "url": "https://raw.githubusercontent.com/gfpcom/free-proxy-list/main/proxies/http.txt",
-        "type": "text",
-    },
-    {
-        "url": "https://raw.githubusercontent.com/gfpcom/free-proxy-list"
-        "/main/proxies/socks5.txt",
-        "type": "text",
-    },
-    {"url": "https://spys.me/proxy.txt", "type": "regex"},
-    {"url": "https://spys.me/socks.txt", "type": "regex"},
-    {"url": "https://www.proxy-list.download/api/v1/get?type=http", "type": "text"},
-    {"url": "https://www.proxy-list.download/api/v1/get?type=https", "type": "text"},
-    {"url": "https://www.proxy-list.download/api/v1/get?type=socks4", "type": "text"},
-    {"url": "https://www.proxy-list.download/api/v1/get?type=socks5", "type": "text"},
-    {"url": "https://api.openproxylist.xyz/http.txt", "type": "text"},
-    {"url": "https://api.openproxylist.xyz/socks4.txt", "type": "text"},
-    {"url": "https://api.openproxylist.xyz/socks5.txt", "type": "text"},
-    {"url": "https://rootjazz.com/proxies/proxies.txt", "type": "text"},
-    {"url": "http://pubproxy.com/api/proxy?limit=20&format=txt", "type": "text"},
-    {
-        "url": "https://raw.githubusercontent.com/iplocate/free-proxy-list"
-        "/main/all-proxies.txt",
-        "type": "text",
-    },
-    {
-        "url": "https://proxylist.geonode.com/api/proxy-list"
-        "?limit=500&sort_by=lastChecked&sort_type=desc",
-        "type": "geonode",
-    },
-]
+from proxyswarm.sources import SOURCES
 
 # Optional `scheme://` prefix followed by `ipv4:port`. Spys.me appends junk
 # (e.g. `1.2.3.4:8080-US-S`); `findall` ignores the trailing suffix.

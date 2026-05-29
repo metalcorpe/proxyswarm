@@ -86,3 +86,29 @@ def test_empty_scrape_runs_without_proxies(tmp_path, monkeypatch):
     missing = tmp_path / "does_not_exist.txt"
 
     assert _load_proxies(str(missing)) == [None]
+
+
+def test_unparseable_port_entries_are_dropped_at_load(tmp_path, monkeypatch):
+    """Entries whose port can't be parsed are dropped at load, not propagated.
+
+    `urlsplit(...).port` raises ValueError on a port outside 0-65535 or a
+    non-numeric port; such an entry would otherwise crash a consumer (the
+    health check, the downloader) mid-run. Both scheme-qualified and bare
+    `host:port` forms must be filtered, leaving only the valid proxy.
+    """
+
+    def _boom():
+        msg = "scrape must not be called when the file has proxies"
+        raise AssertionError(msg)
+
+    monkeypatch.setattr(core, "scrape_proxies", _boom)
+    proxy_file = tmp_path / "proxies.txt"
+    proxy_file.write_text(
+        "http://1.2.3.4:99999\n"  # scheme-qualified, port > 65535
+        "8.8.8.8:70000\n"  # bare host:port, port > 65535
+        "http://9.9.9.9:abc\n"  # non-numeric port
+        "http://5.5.5.5:8080\n",  # valid — the only survivor
+        encoding="utf-8",
+    )
+
+    assert _load_proxies(str(proxy_file)) == ["http://5.5.5.5:8080"]
