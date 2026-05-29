@@ -6,8 +6,8 @@ here silently drops good proxies or admits useless non-routable ones.
 
 import pytest
 
-from proxyswarm import core
-from proxyswarm.core import _is_bogus_proxy_host, _load_proxies
+from proxyswarm import proxysource
+from proxyswarm.proxysource import _is_bogus_proxy_host, _load_proxies
 
 
 @pytest.mark.parametrize(
@@ -48,7 +48,7 @@ def test_existing_file_skips_scraping(tmp_path, monkeypatch):
         msg = "scrape must not be called when the file has proxies"
         raise AssertionError(msg)
 
-    monkeypatch.setattr(core, "scrape_proxies", _boom)
+    monkeypatch.setattr(proxysource, "scrape_proxies", _boom)
     proxy_file = tmp_path / "proxies.txt"
     proxy_file.write_text("http://8.8.8.8:8080\n", encoding="utf-8")
 
@@ -62,7 +62,7 @@ def test_empty_file_falls_back_to_scrape_then_classifies(tmp_path, monkeypatch):
     IP must be dropped, and the result must land on disk for restart reuse.
     """
     monkeypatch.setattr(
-        core,
+        proxysource,
         "scrape_proxies",
         lambda: ["8.8.8.8:1080", "1.2.3.4:3128", "192.168.0.1:8080"],
     )
@@ -82,7 +82,7 @@ def test_empty_file_falls_back_to_scrape_then_classifies(tmp_path, monkeypatch):
 
 def test_empty_scrape_runs_without_proxies(tmp_path, monkeypatch):
     """Missing file + empty scrape degrades to the single-`None` sentinel."""
-    monkeypatch.setattr(core, "scrape_proxies", list)
+    monkeypatch.setattr(proxysource, "scrape_proxies", list)
     missing = tmp_path / "does_not_exist.txt"
 
     assert _load_proxies(str(missing)) == [None]
@@ -101,7 +101,7 @@ def test_unparseable_port_entries_are_dropped_at_load(tmp_path, monkeypatch):
         msg = "scrape must not be called when the file has proxies"
         raise AssertionError(msg)
 
-    monkeypatch.setattr(core, "scrape_proxies", _boom)
+    monkeypatch.setattr(proxysource, "scrape_proxies", _boom)
     proxy_file = tmp_path / "proxies.txt"
     proxy_file.write_text(
         "http://1.2.3.4:99999\n"  # scheme-qualified, port > 65535
