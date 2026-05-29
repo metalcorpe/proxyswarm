@@ -27,7 +27,6 @@ import time
 from urllib.parse import urlsplit
 
 from loguru import logger
-from tqdm import tqdm
 
 if sys.platform == "win32":  # pragma: no cover - no POSIX fd limits to raise
     _resource = None
@@ -101,14 +100,14 @@ async def _probe_http(
         reader, writer = await asyncio.wait_for(
             asyncio.open_connection(host, port), timeout=connect_timeout
         )
-    except OSError, TimeoutError:
+    except (OSError, TimeoutError):
         return None
 
     try:
         writer.write(request)
         await asyncio.wait_for(writer.drain(), timeout=read_timeout)
         status_line = await asyncio.wait_for(reader.readline(), timeout=read_timeout)
-    except OSError, TimeoutError:
+    except (OSError, TimeoutError):
         return None
     finally:
         await _close(writer)
@@ -130,7 +129,7 @@ async def _probe_tcp(host: str, port: int, *, connect_timeout: float) -> float |
         _reader, writer = await asyncio.wait_for(
             asyncio.open_connection(host, port), timeout=connect_timeout
         )
-    except OSError, TimeoutError:
+    except (OSError, TimeoutError):
         return None
     await _close(writer)
     return _elapsed_ms(start)
@@ -172,27 +171,25 @@ async def _check_all(
     connect_timeout: float,
     read_timeout: float,
     target_alive: int,
-    progress: tqdm | None,
 ) -> dict[str, float]:
     """Check proxies via a bounded worker pool; return alive -> latency ms.
 
-    A fixed pool of `concurrency` workers drains a queue, so at most that many
-    checks (and sockets) are ever in flight regardless of list size. When
-    `target_alive` is positive, the pool stops as soon as that many live proxies
-    are found — the remaining workers exit after their current check, so the
-    overshoot is at most `concurrency - 1`. `target_alive=0` checks everything.
+    A fixed pool of `concurrency` workers drains a single shared iterator, so at
+    most that many checks (and sockets) are ever in flight regardless of list
+    size — and no second copy of the list is built (cf. a pre-filled queue).
+    `next()` on a list iterator has no `await` inside it, so concurrent workers
+    can't draw the same item. When `target_alive` is positive, the pool stops as
+    soon as that many live proxies are found — the remaining workers exit after
+    their current check, so the overshoot is at most `concurrency - 1`.
+    `target_alive=0` checks everything.
     """
-    queue: asyncio.Queue[str] = asyncio.Queue()
-    for proxy in proxies:
-        queue.put_nowait(proxy)
+    pending = iter(proxies)
     results: dict[str, float] = {}
     enough = asyncio.Event()
 
     async def worker() -> None:
-        while not enough.is_set():
-            try:
-                proxy = queue.get_nowait()
-            except asyncio.QueueEmpty:
+        for proxy in pending:
+            if enough.is_set():
                 return
             latency = await _check_one(
                 proxy,
@@ -204,8 +201,7 @@ async def _check_all(
                 results[proxy] = latency
                 if target_alive and len(results) >= target_alive:
                     enough.set()
-            if progress is not None:
-                progress.update(1)
+                    return
 
     pool_size = min(concurrency, len(proxies))
     await asyncio.gather(*(asyncio.create_task(worker()) for _ in range(pool_size)))
@@ -220,7 +216,6 @@ def check_proxies(
     connect_timeout: float = 3.0,
     read_timeout: float = 4.0,
     target_alive: int = 0,
-    show_progress: bool = True,
 ) -> dict[str, float]:
     """Concurrently liveness-check `proxies`; return alive ones -> latency ms.
 
@@ -241,26 +236,16 @@ def check_proxies(
         effective,
         target_alive or "all",
     )
-    progress = (
-        tqdm(total=len(candidates), desc="proxy health", unit="proxy")
-        if show_progress
-        else None
-    )
-    try:
-        results = asyncio.run(
-            _check_all(
-                candidates,
-                test_url=test_url,
-                concurrency=effective,
-                connect_timeout=connect_timeout,
-                read_timeout=read_timeout,
-                target_alive=target_alive,
-                progress=progress,
-            )
+    results = asyncio.run(
+        _check_all(
+            candidates,
+            test_url=test_url,
+            concurrency=effective,
+            connect_timeout=connect_timeout,
+            read_timeout=read_timeout,
+            target_alive=target_alive,
         )
-    finally:
-        if progress is not None:
-            progress.close()
+    )
 
     logger.success("Health check complete: {} live proxies found", len(results))
     return results
